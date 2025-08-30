@@ -15,53 +15,121 @@ const OLLAMA_BASE    = process.env.OLLAMA_BASE    || "http://5.188.150.5:11434";
 const OLLAMA_MODEL   = process.env.OLLAMA_MODEL   || "gpt-oss:20b";               // try qwen3:32b if you prefer
 
 // Extended schema: fraud verdict + warnings + summary (original language) + language + keywords
+// --- CONFIGURED SCHEMA (replace the old SCHEMA const) ---
 const SCHEMA = JSON.stringify({
   type: "object",
   properties: {
-    is_fraud: { type: "boolean" },
-    risk_score: { type: "number", minimum: 0, maximum: 1 },
-    verdict: { type: "string", maxLength: 220 },
+    // High-level verdict
+    is_fraud: { type: "boolean" },                          // true == фишинг/мошенничество/имперсонация брендов/выплаты
+    risk_score: { type: "number", minimum: 0, maximum: 1 }, // 0..1 по рубрике ниже
+    verdict: { type: "string", maxLength: 220 },            // краткая причина
 
-    content_warnings: {
+    // Fine-grained categories required by policy
+    content_categories: {
       type: "object",
       properties: {
-        drugs: { type: "boolean" },              // recreational/illegal drug sales/promotions
-        sexual_services: { type: "boolean" }     // prostitution or paid sexual services
+        porn_erotica: { type: "boolean" },                // порно/эротика (не путать с проституцией)
+        sexual_services: { type: "boolean" },             // интим-услуги/проституция
+        drugs: { type: "boolean" },                       // наркотики/псилоцибин/атрибуты
+        extremism: { type: "boolean" },                   // символика/пропаганда/призывы
+        casino_gambling: { type: "boolean" },             // казино/букмекеры/азартные игры
+        weapons: { type: "boolean" },                     // огнестрел/холодное/торговля оружием
+        phishing: { type: "boolean" },                    // сбор логинов/паролей/кодов/кошельков
+        government_services_impersonation: { type: "boolean" }, // подмена/имитация гос-сервисов/порталов
+        redirect_buttons: { type: "boolean" },            // кнопки/виджеты, маскирующие редирект
+        financial_scam_payouts: { type: "boolean" }       // «выплаты», легкие деньги, лохотроны
       },
-      required: ["drugs", "sexual_services"],
+      required: [
+        "porn_erotica","sexual_services","drugs","extremism","casino_gambling",
+        "weapons","phishing","government_services_impersonation","redirect_buttons",
+        "financial_scam_payouts"
+      ],
       additionalProperties: false
     },
 
-    language: { type: "string", pattern: "^[a-z]{2}(-[A-Z]{2})?$" }, // ISO 639-1 (optionally with region)
-    summary: { type: "string", maxLength: 400 },                      // must be in original language
+    // Lang + on-page summary/keywords (original language)
+    language: { type: "string", pattern: "^[a-z]{2}(-[A-Z]{2})?$" },
+    summary: { type: "string", maxLength: 400 },
     keywords: {
       type: "array",
-      items: { type: "string", maxLength: 40 },                       // in original language
+      items: { type: "string", maxLength: 40 },
       minItems: 3,
       maxItems: 12
+    },
+
+    // Useful debug fields for moderators
+    evidence: {
+      type: "array",
+      items: { type: "string", maxLength: 120 },          // короткие цитаты/фрагменты из markdown
+      minItems: 1,
+      maxItems: 6
+    },
+    impersonated_brands: {
+      type: "array",
+      items: { type: "string", maxLength: 50 },
+      minItems: 0,
+      maxItems: 8
+    },
+    hosting: {
+      type: "object",
+      properties: {
+        domain: { type: "string", maxLength: 200 },
+        is_tilda: { type: "boolean" }                     // true если домен выглядит как tilda (например, *.tilda.ws)
+      },
+      required: ["domain", "is_tilda"],
+      additionalProperties: false
     }
   },
-  required: ["is_fraud", "risk_score", "verdict", "content_warnings", "language", "summary", "keywords"],
+  required: [
+    "is_fraud","risk_score","verdict",
+    "content_categories","language","summary","keywords",
+    "evidence","impersonated_brands","hosting"
+  ],
   additionalProperties: false
 });
 
+
 // Prompt: strict JSON, original-language summary/keywords, plus the fraud rubric
-const PROMPT = `You are a web security/content analyst.
-Rules:
-1) Output ONLY valid minified JSON matching the schema below. No prose, no markdown, no extra keys.
-2) Use ONLY on-page content (scraped markdown provided). Do NOT follow external links or use off-page info.
-3) Detect the page's original language accurately (ISO 639-1, optionally region), and write both "summary" and "keywords" in that same language.
-4) Fraud rubric for "risk_score":
-   - ≥0.80: clear fraud/phishing/scam or urgent payment/credential capture/brand impersonation
-   - 0.40–0.79: multiple red flags but partial evidence
-   - <0.40: likely legitimate/informational
-5) Content warnings:
-   - "drugs": true if the page promotes/sells illegal/controlled recreational drugs or paraphernalia or mushrooms.
-   - "sexual_services": true if the page advertises prostitution or paid sexual services.
-6) "keywords": return 3–12 short, topical keywords (no hashtags), in original language; avoid duplicates.
+const PROMPT = `You are a web security & trust & safety analyst.
+
+Rules (very strict):
+1) Output ONLY valid **minified JSON** matching the provided schema. No prose, markdown, comments, or extra keys.
+2) Use ONLY on-page content (the scraped markdown below). Do NOT imagine images. Treat alt-text, filenames, captions, anchors, and button labels as text evidence. Do NOT follow links.
+3) Detect the original page language (ISO 639-1, optional region). Write both "summary" and "keywords" in that same language.
+4) Fill "hosting":
+   - "domain": the primary domain you can infer from links/markdown context; if unknown, use an empty string "".
+   - "is_tilda": true if the domain looks like a Tilda host (e.g., ends with ".tilda.ws" or similar Tilda patterns); else false.
+5) Category definitions ("content_categories"):
+   - porn_erotica: porn/erotica/nudity meant for arousal (not the same as prostitution ads).
+   - sexual_services: prostitution/paid sexual services/escorts/sex work ads.
+   - drugs: illegal/controlled recreational drugs (incl. mushrooms) or paraphernalia sales/promo.
+   - extremism: extremist symbols, propaganda, recruiting, praise of violent orgs/acts.
+   - casino_gambling: casinos, betting, lotteries with real-money stakes or promos (incl. recognizable betting/casino logos).
+   - weapons: sale/promo of firearms, ammunition, combat knives, or instructions to traffic these.
+   - phishing: credential/payment capture, fake logins/2FA, seed phrases, wallet drains, brand or government impersonation forms.
+   - government_services_impersonation: pages imitating official government portals/services to collect data or payments.
+   - redirect_buttons: UI that disguises redirects (e.g., deceptive "Download/Play/Continue" that lead elsewhere).
+   - financial_scam_payouts: promises of instant payouts/benefits with upfront fees, “get rich quick”, pyramid-like pitches.
+   Set each boolean strictly from the markdown evidence (true if present/promoted; otherwise false).
+6) Fraud rubric:
+   - "is_fraud": true if the page aims to deceive or steal (e.g., phishing, impersonation, payout scams). False otherwise.
+   - "risk_score":
+       ≥0.90 clear fraud/phishing/impersonation with capture forms, seed/wallet requests, or multiple severe violations.
+       0.70–0.89 strong evidence of violations (e.g., explicit drug sales, prostitution ads, extremist propaganda, weapons trade, casino with payment funnels), or multiple red flags.
+       0.40–0.69 partial/indirect evidence, suggestive language, or weak signals.
+       <0.40 likely informational or benign.
+7) "verdict": one concise sentence (<=220 chars) explaining the top reason(s) for the score, naming categories (and brand/government names if applicable).
+8) "evidence": 1–6 short quotes/snippets from the markdown that justify the decision (remove PII; keep quotes short).
+9) "impersonated_brands": brand/org names being mimicked (banks, wallets, gov portals), if any; else [].
+10) "keywords": 3–12 topical keywords (no hashtags), in the original language; avoid duplicates.
+11) "summary": <=400 chars, in the original language, neutral tone.
+12) Be conservative: if signals are weak, lower the score and set unrelated categories to false.
 
 Schema: ${SCHEMA}
-Return ONLY the JSON object.`;
+
+Return ONLY the JSON object.
+
+`;
 
 // --- Helpers ---
 async function scrapeMarkdown(url) {
