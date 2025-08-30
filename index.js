@@ -5,14 +5,15 @@
 import express from "express";
 import axios from "axios";
 import chalk from "chalk";
+import { redisReadyPromise, methods } from './redis.js';  // Import the promise
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // --- CONFIG ---
 const FIRECRAWL_BASE = process.env.FIRECRAWL_BASE || "http://5.188.178.213:3002";
-const OLLAMA_BASE    = process.env.OLLAMA_BASE    || "http://5.188.150.5:11434"; // your Ollama host
-const OLLAMA_MODEL   = process.env.OLLAMA_MODEL   || "gpt-oss:20b";               // try qwen3:32b if you prefer
+const N8N_WEBHOOK_URL = "https://n8n.edgecenter.ru/webhook/d0f48489-1df0-47c2-a48d-b557bb5e4cda";
+const TIMEOUT_MS = 15 * 60 * 1000; // 10 minutes
 
 // Extended schema: fraud verdict + warnings + summary (original language) + language + keywords
 // --- CONFIGURED SCHEMA (replace the old SCHEMA const) ---
@@ -40,8 +41,8 @@ const SCHEMA = JSON.stringify({
         financial_scam_payouts: { type: "boolean" }       // «выплаты», легкие деньги, лохотроны
       },
       required: [
-        "porn_erotica","sexual_services","drugs","extremism","casino_gambling",
-        "weapons","phishing","government_services_impersonation","redirect_buttons",
+        "porn_erotica", "sexual_services", "drugs", "extremism", "casino_gambling",
+        "weapons", "phishing", "government_services_impersonation", "redirect_buttons",
         "financial_scam_payouts"
       ],
       additionalProperties: false
@@ -81,9 +82,9 @@ const SCHEMA = JSON.stringify({
     }
   },
   required: [
-    "is_fraud","risk_score","verdict",
-    "content_categories","language","summary","keywords",
-    "evidence","impersonated_brands","hosting"
+    "is_fraud", "risk_score", "verdict",
+    "content_categories", "language", "summary", "keywords",
+    "evidence", "impersonated_brands", "hosting"
   ],
   additionalProperties: false
 });
@@ -109,7 +110,7 @@ Rules (very strict):
    - phishing: credential/payment capture, fake logins/2FA, seed phrases, wallet drains, brand or government impersonation forms.
    - government_services_impersonation: pages imitating official government portals/services to collect data or payments.
    - redirect_buttons: UI that disguises redirects (e.g., deceptive "Download/Play/Continue" that lead elsewhere).
-   - financial_scam_payouts: promises of instant payouts/benefits with upfront fees, “get rich quick”, pyramid-like pitches.
+   - financial_scam_payouts: promises of instant payouts/benefits with upfront fees, "get rich quick", pyramid-like pitches.
    Set each boolean strictly from the markdown evidence (true if present/promoted; otherwise false).
 6) Fraud rubric:
    - "is_fraud": true if the page aims to deceive or steal (e.g., phishing, impersonation, payout scams). False otherwise.
@@ -155,47 +156,68 @@ async function scrapeMarkdown(url) {
   return md;
 }
 
-async function classifyWithOllama(markdown, url) {
-  console.log(chalk.blueBright(`[OLLAMA] → ${OLLAMA_MODEL}, sending ${markdown.length} chars`));
+async function classifyWithN8N(markdown, url) {
+  console.log(chalk.blueBright(`[N8N] → Sending ${markdown.length} chars to webhook`));
+  console.log(N8N_WEBHOOK_URL);
+
+  // Wait for Redis to be ready
+  await redisReadyPromise;
 
   const { data } = await axios.post(
-    `${OLLAMA_BASE}/api/generate`,
+    N8N_WEBHOOK_URL,
     {
-      model: OLLAMA_MODEL,
-      stream: false,
-      options: { temperature: 0 }, // low temp → better JSON compliance
-      prompt: `${PROMPT}\n\nPage markdown:\n\n${markdown}`
+      prompt: `${PROMPT}\n\nPage markdown:\n\n${markdown}`,
+      url: url
     },
-    { headers: { "Content-Type": "application/json" } }
+    { 
+      headers: { "Content-Type": "application/json" },
+      timeout: 10 * 60 * 1000 // 10 minutes
+    }
   );
 
-  const text = data?.response?.trim();
-  if (!text) {
-    console.log(chalk.red(`[OLLAMA] ✗ Empty response`));
-    throw new Error("Empty response from Ollama");
+  const requestId = data?.request_id;
+  if (!requestId) {
+    console.log(chalk.red(`[N8N] ✗ No request_id in response`));
+    throw new Error("No request_id from N8N webhook");
   }
 
-  console.log(chalk.yellow(`[OLLAMA] Raw response (first 400 chars):\n${text.slice(0, 400)}${text.length > 400 ? "..." : ""}`));
+  console.log(chalk.blue(`[N8N] Got request_id: ${requestId}`));
 
-  // Parse JSON (with salvage attempt)
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    const m = text.match(/\{[\s\S]*\}$/); // last JSON-ish object
-    if (m) {
-      try { parsed = JSON.parse(m[0]); } catch {}
+  // Poll Redis for results
+  const redisKey = `tilda_${requestId}`;
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < TIMEOUT_MS) {
+    console.log(chalk.yellow(`[REDIS] Checking ${redisKey}...`));
+    
+    const result = await methods.get(redisKey);
+    if (result) {
+      console.log(chalk.green(`[REDIS] ✓ Found result for ${requestId}`));
+      
+      // Parse JSON result
+      let parsed;
+      try {
+        parsed = JSON.parse(result);
+      } catch (e) {
+        console.log(chalk.red(`[REDIS] ✗ Failed to parse JSON result: ${e.message}`));
+        throw new Error("Invalid JSON in Redis result");
+      }
+
+      console.log(chalk.green(`[N8N] ✓ Parsed JSON for ${url}`));
+      return parsed;
     }
-  }
-  if (!parsed) throw new Error("Ollama returned non-JSON");
 
-  console.log(chalk.green(`[OLLAMA] ✓ Parsed JSON for ${url}`));
-  return parsed;
+    // Wait 20 seconds before next check
+    await new Promise(resolve => setTimeout(resolve, 20000));
+  }
+
+  // Timeout reached
+  throw new Error("Timeout waiting for N8N webhook result");
 }
 
 // Pretty warnings in console
 function logWarnings(result) {
-  const w = result?.content_warnings || {};
+  const w = result?.content_categories || {};
   if (w.drugs || w.sexual_services) {
     const flags = [
       w.drugs ? chalk.bgRed.white(" DRUGS ") : null,
@@ -219,7 +241,7 @@ app.post("/classify", async (req, res) => {
     const md = await scrapeMarkdown(url);
     if (!md) return res.status(502).json({ error: "No markdown from Firecrawl" });
 
-    const result = await classifyWithOllama(md, url);
+    const result = await classifyWithN8N(md, url);
     logWarnings(result);
 
     // brief console summary
@@ -230,6 +252,7 @@ app.post("/classify", async (req, res) => {
 
     return res.json({ success: true, url, result });
   } catch (e) {
+    console.log(e)
     console.log(chalk.red(`[ERROR] ${e.message || e}`));
     return res.status(500).json({ success: false, error: String(e.message || e) });
   }
@@ -242,6 +265,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(chalk.greenBright(`\nServer running on http://0.0.0.0:${PORT}`));
   console.log(chalk.green(`Firecrawl: ${FIRECRAWL_BASE}`));
-  console.log(chalk.green(`Ollama:    ${OLLAMA_BASE}  model=${OLLAMA_MODEL}\n`));
+  console.log(chalk.green(`N8N Webhook: ${N8N_WEBHOOK_URL}\n`));
 });
-
