@@ -96,7 +96,7 @@ const PROMPT = `You are a web security & trust & safety analyst.
 Rules (very strict):
 1) Output ONLY valid **minified JSON** matching the provided schema. No prose, markdown, comments, or extra keys.
 2) Use ONLY on-page content (the scraped markdown below). Do NOT imagine images. Treat alt-text, filenames, captions, anchors, and button labels as text evidence. Do NOT follow links.
-3) Detect the original page language (ISO 639-1, optional region). Write both "summary" and "keywords" in that same language.
+3) Detect the original page language (ISO 639-1, optional region). Write both "summary" and "keywords" in Russian language only!
 4) Fill "hosting":
    - "domain": the primary domain you can infer from links/markdown context; if unknown, use an empty string "".
    - "is_tilda": true if the domain looks like a Tilda host (e.g., ends with ".tilda.ws" or similar Tilda patterns); else false.
@@ -155,7 +155,50 @@ async function scrapeMarkdown(url) {
   }
   return md;
 }
+async function classifyWithReplicate(markdown, url) {
+  console.log(chalk.blueBright(`[REPLICATE] → Sending ${markdown.length} chars to API`));
+  
+  const { data } = await axios.post(
+    'https://api.replicate.com/v1/models/openai/gpt-oss-120b/predictions',
+    {
+      input: {
+        top_p: 1,
+        prompt: `${PROMPT}\n\nPage markdown:\n\n${markdown}`,
+        max_tokens: 8024,
+        temperature: 0.1,
+        presence_penalty: 0,
+        frequency_penalty: 0
+      }
+    },
+    { 
+      headers: { 
+        "Authorization": "Bearer 9db188dadde7ff98174dc76fef4b168060cdb37b",
+        "Content-Type": "application/json",
+        "Prefer": "wait"
+      },
+      timeout: 10 * 60 * 1000 // 10 minutes
+    }
+  );
 
+  console.log(chalk.green(`[REPLICATE] ✓ Got response for ${url}`));
+  
+  // Parse the response output
+  let parsed;
+  try {
+    const output = data?.output;
+    if (typeof output === 'string') {
+      parsed = JSON.parse(output);
+    } else {
+      parsed = output;
+    }
+  } catch (e) {
+    console.log(chalk.red(`[REPLICATE] ✗ Failed to parse response: ${e.message}`));
+    throw new Error("Invalid response from Replicate API");
+  }
+
+  console.log(chalk.green(`[REPLICATE] ✓ Parsed JSON for ${url}`));
+  return parsed;
+}
 async function classifyWithN8N(markdown, url) {
   console.log(chalk.blueBright(`[N8N] → Sending ${markdown.length} chars to webhook`));
   console.log(N8N_WEBHOOK_URL);
