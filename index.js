@@ -284,7 +284,7 @@ app.post("/classify", async (req, res) => {
     const md = await scrapeMarkdown(url);
     if (!md) return res.status(502).json({ error: "No markdown from Firecrawl" });
 
-    const result = await classifyWithN8N(md, url);
+    const result = await classifyWithReplicate(md, url);
     logWarnings(result);
 
     // brief console summary
