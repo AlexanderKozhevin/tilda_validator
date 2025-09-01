@@ -173,32 +173,82 @@ async function classifyWithReplicate(markdown, url) {
     { 
       headers: { 
         "Authorization": "Bearer 9db188dadde7ff98174dc76fef4b168060cdb37b",
-        "Content-Type": "application/json",
-        "Prefer": "wait"
+        "Content-Type": "application/json"
       },
       timeout: 10 * 60 * 1000 // 10 minutes
     }
   );
 
-  console.log(chalk.green(`[REPLICATE] ✓ Got response for ${url}`));
-  
-  // Parse the response output
-  let parsed;
-  try {
-    const output = data?.output;
-    if (typeof output === 'string') {
-      parsed = JSON.parse(output);
-    } else {
-      parsed = output;
-    }
-  } catch (e) {
-    console.log(chalk.red(`[REPLICATE] ✗ Failed to parse response: ${e.message}`));
-    throw new Error("Invalid response from Replicate API");
+  console.log(chalk.green(`[REPLICATE] ✓ Got initial response for ${url}`));
+  console.log(data);
+
+  const predictionId = data?.id;
+  if (!predictionId) {
+    console.log(chalk.red(`[REPLICATE] ✗ No prediction ID in response`));
+    throw new Error("No prediction ID from Replicate API");
   }
 
-  console.log(chalk.green(`[REPLICATE] ✓ Parsed JSON for ${url}`));
-  return parsed;
+  console.log(chalk.blue(`[REPLICATE] Got prediction ID: ${predictionId}`));
+
+  // Poll for completion
+  const startTime = Date.now();
+  const TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+  
+  while (Date.now() - startTime < TIMEOUT_MS) {
+    console.log(chalk.yellow(`[REPLICATE] Checking prediction status...`));
+    
+    const { data: statusData } = await axios.get(
+      `https://api.replicate.com/v1/predictions/${predictionId}`,
+      { 
+        headers: { 
+          "Authorization": "Bearer 9db188dadde7ff98174dc76fef4b168060cdb37b",
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    console.log(chalk.cyan(`[REPLICATE] Status: ${statusData.status}`));
+
+    if (statusData.status === 'succeeded') {
+      console.log(chalk.green(`[REPLICATE] ✓ Prediction completed for ${url}`));
+      console.log(statusData.output);
+      
+      // Handle array output format from Replicate
+      let output = statusData?.output;
+      if (Array.isArray(output)) {
+        // Join array elements and filter out empty strings
+        output = output.filter(item => item && item.trim() !== '').join('');
+      }
+      
+      // Parse the response output
+      let parsed;
+      try {
+        if (typeof output === 'string') {
+          parsed = JSON.parse(output);
+        } else {
+          parsed = output;
+        }
+      } catch (e) {
+        console.log(chalk.red(`[REPLICATE] ✗ Failed to parse response: ${e.message}`));
+        throw new Error("Invalid response from Replicate API");
+      }
+
+      console.log(chalk.green(`[REPLICATE] ✓ Parsed JSON for ${url}`));
+      return parsed;
+    } else if (statusData.status === 'failed' || statusData.status === 'canceled') {
+      console.log(chalk.red(`[REPLICATE] ✗ Prediction ${statusData.status}: ${statusData.error || 'Unknown error'}`));
+      throw new Error(`Replicate prediction ${statusData.status}: ${statusData.error || 'Unknown error'}`);
+    }
+
+    // Wait 5 seconds before next check
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+
+  // Timeout reached
+  throw new Error("Timeout waiting for Replicate prediction to complete");
 }
+
+
 async function classifyWithN8N(markdown, url) {
   console.log(chalk.blueBright(`[N8N] → Sending ${markdown.length} chars to webhook`));
   console.log(N8N_WEBHOOK_URL);
